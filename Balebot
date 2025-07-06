@@ -1,0 +1,705 @@
+import time
+import json
+import urllib.request
+import urllib.parse
+import urllib.error
+from datetime import datetime
+
+# توکن ربات شما
+TOKEN = "356132157:tSJcwKdGlZYk7Allppx1NGJ7JLc7PkMtFK3QETHx"
+BASE_URL = f"https://tapi.bale.ai/bot{TOKEN}/"
+CARD_NUMBER = "5022291530744570"  # شماره کارت مقصد
+SUPPORT_ID = "@ehsan1129"  # آیدی پشتیبانی
+
+# کدهای هدیه معتبر
+GIFT_CODES = ["13831391", "85698569"]
+
+# دیکشنری قیمت و مدت پکیج‌ها (به ریال)
+PACKAGES = {
+    "روزانه - ۲۰ هزار تومان": {
+        "price": 200000,  # 20,000 تومان = 200,000 ریال
+        "duration": 1  # مدت به روز
+    },
+    "هفتگی - ۱۰۰ هزار تومان": {
+        "price": 1000000,  # 100,000 تومان = 1,000,000 ریال
+        "duration": 7  # مدت به روز
+    },
+    "ماهانه - ۲۰۰ هزار تومان": {
+        "price": 2000000,  # 200,000 تومان = 2,000,000 ریال
+        "duration": 30  # مدت به روز
+    },
+    "هفتگی رایگان - کد هدیه": {
+        "price": 0,
+        "duration": 7  # مدت به روز
+    }
+}
+
+# ذخیره تمام سوالات و درخواست‌های کاربران
+archived_questions = []
+
+# کاربران ویژه (کسانی که کد هدیه 13831391 را وارد کرده‌اند)
+special_users = set()
+
+# تعداد درخواست‌های باقیمانده برای برنامه‌ریزی ویژه
+remaining_program_requests = {}
+
+# توابع درخواست
+def get_updates(offset=None):
+    url = BASE_URL + "getUpdates"
+    params = {}
+    if offset:
+        params["offset"] = offset
+    if params:
+        url += "?" + urllib.parse.urlencode(params)
+    
+    try:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0"},
+            method="GET"
+        )
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"خطای شبکه: {str(e)}")
+        return {"ok": False, "result": []}
+
+
+def send_message(chat_id, text, reply_markup=None):
+    url = BASE_URL + "sendMessage"
+    data = {
+        "chat_id": chat_id,
+        "text": text
+    }
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    
+    data_encoded = urllib.parse.urlencode(data).encode('utf-8')
+    request = urllib.request.Request(
+        url,
+        data=data_encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            # لاگ پیام ارسالی
+            print(f"🤖 ربات: {text[:50]}{'...' if len(text) > 50 else ''}")
+            return json.loads(response.read().decode('utf-8'))
+    except Exception as e:
+        print(f"خطا در ارسال پیام: {str(e)}")
+        return None
+
+
+def send_invoice(chat_id, title, description, payload, prices):
+    """ارسال درخواست پرداخت کارت به کارت"""
+    url = BASE_URL + "sendInvoice"
+    data = {
+        "chat_id": chat_id,
+        "title": title,
+        "description": description,
+        "payload": payload,
+        "provider_token": CARD_NUMBER,  # شماره کارت مقصد
+        "currency": "IRT",  # تومان
+        "prices": json.dumps(prices),
+        "need_name": False,
+        "need_phone_number": False,
+        "need_email": False,
+        "need_shipping_address": False,
+        "is_flexible": False,
+        "provider_data": json.dumps({"type": "card"})  # مشخص کردن نوع پرداخت
+    }
+    
+    data_encoded = urllib.parse.urlencode(data).encode('utf-8')
+    request = urllib.request.Request(
+        url,
+        data=data_encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"}
+    )
+    
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            print(f"💳 درخواست پرداخت برای {title} ارسال شد")
+            return json.loads(response.read().decode('utf-8'))
+    except urllib.error.HTTPError as e:
+        # دریافت متن خطا برای تشخیص مشکل
+        error_content = e.read().decode('utf-8')
+        print(f"❌ خطا در ارسال درخواست پرداخت: {e.code} {e.reason}")
+        print(f"📝 محتوای خطا: {error_content}")
+        return None
+    except Exception as e:
+        print(f"❌ خطا در ارسال درخواست پرداخت: {str(e)}")
+        return None
+
+
+# منوها
+def get_main_menu(user_id, active_packages):
+    """منوی اصلی با توجه به وضعیت پکیج کاربر"""
+    # بررسی فعال بودن پکیج
+    active = False
+    if user_id in active_packages:
+        package = active_packages[user_id]
+        if time.time() < package["expiry"]:
+            active = True
+        else:
+            # حذف پکیج منقضی شده
+            del active_packages[user_id]
+            # ارسال پیام تمدید
+            send_message(
+                package["chat_id"],
+                "⏳ پکیج شما به پایان رسید.\n\n"
+                "اگر از خدمات ما راضی بودید، خوشحال می‌شیم تمدید کنید 😊\n\n"
+                "برای خرید پکیج جدید از منوی اصلی گزینه 'پکیج‌ها 💼' را انتخاب کنید."
+            )
+    
+    # ایجاد منو با امکان ویژه برای کاربران خاص
+    keyboard = []
+    
+    if active:
+        keyboard = [
+            [{"text": "پکیج‌ها 💼"}],
+            [{"text": "پشتیبانی 👨‍💼"}, {"text": "سوال کردن! ❓"}]
+        ]
+        
+        # اضافه کردن گزینه برنامه ویژه برای پکیج‌های هفتگی و ماهانه
+        package_type = active_packages[user_id]["type"]
+        if "هفتگی" in package_type or "ماهانه" in package_type:
+            keyboard.append([{"text": "برنامه ویژه ⭐"}])
+    else:
+        keyboard = [
+            [{"text": "پکیج‌ها 💼"}],
+            [{"text": "پشتیبانی 👨‍💼"}]
+        ]
+    
+    # اضافه کردن گزینه‌های ویژه برای کاربران خاص
+    if user_id in special_users:
+        keyboard.append([{"text": "بایگانی سوالات 📂"}])
+        keyboard.append([{"text": "ارسال جواب ✉️"}])
+    
+    keyboard.append([{"text": "بازگشت به منوی اصلی 🏠"}])
+    
+    return {
+        "keyboard": keyboard,
+        "resize_keyboard": True
+    }
+
+
+PACKAGE_MENU = {
+    "keyboard": [
+        [{"text": "روزانه - ۲۰ هزار تومان"}],
+        [{"text": "هفتگی - ۱۰۰ هزار تومان"}],
+        [{"text": "ماهانه - ۲۰۰ هزار تومان"}],
+        [{"text": "کد هدیه 🎁"}],
+        [{"text": "بازگشت به منوی اصلی 🏠"}]
+    ],
+    "resize_keyboard": True
+}
+
+GIFT_CODE_MENU = {
+    "keyboard": [
+        [{"text": "بازگشت به منوی اصلی 🏠"}]
+    ],
+    "resize_keyboard": True
+}
+
+QUESTION_MENU = {
+    "keyboard": [
+        [{"text": "بازگشت به منوی اصلی 🏠"}]
+    ],
+    "resize_keyboard": True
+}
+
+PROGRAM_MENU = {
+    "keyboard": [
+        [{"text": "بازگشت به منوی اصلی 🏠"}]
+    ],
+    "resize_keyboard": True
+}
+
+ANSWER_USER_MENU = {
+    "keyboard": [
+        [{"text": "لغو عملیات ❌"}]
+    ],
+    "resize_keyboard": True
+}
+
+
+# اجرای ربات
+def main():
+    global archived_questions, special_users, remaining_program_requests
+    
+    print("🤖 ربات در حال اجراست...")
+    last_update_id = 0
+    user_states = {}  # برای پیگیری وضعیت کاربران
+    active_packages = {}  # پکیج‌های فعال کاربران: {user_id: {"expiry": زمان انقضا, "type": نوع پکیج, "chat_id": آیدی چت}}
+    premium_programs = {
+        "روزانه - ۲۰ هزار تومان": "لینک برنامه ویژه روزانه",
+        "هفتگی - ۱۰۰ هزار تومان": "لینک برنامه ویژه هفتگی",
+        "ماهانه - ۲۰۰ هزار تومان": "لینک برنامه ویژه ماهانه",
+        "هفتگی رایگان - کد هدیه": "لینک برنامه ویژه هفتگی"
+    }
+    
+    # متغیرهای موقت برای پاسخگویی
+    answer_target_user = None
+    answer_text = None
+
+    while True:
+        try:
+            updates = get_updates(offset=last_update_id)
+            
+            if not updates.get("ok") or "result" not in updates:
+                time.sleep(1)
+                continue
+                
+            for update in updates.get("result", []):
+                message = update.get("message", {})
+                chat_id = message.get("chat", {}).get("id")
+                text = message.get("text", "")
+                update_id = update.get("update_id", 0)
+                user_id = message.get("from", {}).get("id")
+                first_name = message.get("from", {}).get("first_name", "")
+                username = message.get('from', {}).get('username', 'N/A')
+                successful_payment = message.get('successful_payment')
+
+                if update_id > last_update_id:
+                    last_update_id = update_id
+
+                if not chat_id or not user_id:
+                    continue
+                
+                # بررسی انقضای پکیج
+                if user_id in active_packages and time.time() >= active_packages[user_id]["expiry"]:
+                    # ارسال پیام انقضا
+                    send_message(
+                        chat_id,
+                        "⏳ پکیج شما به پایان رسید.\n\n"
+                        "اگر از خدمات ما راضی بودید، خوشحال می‌شیم تمدید کنید 😊\n\n"
+                        "برای خرید پکیج جدید از منوی اصلی گزینه 'پکیج‌ها 💼' را انتخاب کنید."
+                    )
+                    # حذف پکیج منقضی شده
+                    del active_packages[user_id]
+                    if user_id in remaining_program_requests:
+                        del remaining_program_requests[user_id]
+                
+                # لاگ پیام دریافتی از کاربر با آیدی بله
+                if text:
+                    if username != 'N/A':
+                        print(f"👤 کاربر (@{username}): {text}")
+                    else:
+                        print(f"👤 کاربر (ID:{user_id}): {text}")
+
+                # پرداخت موفق
+                if successful_payment:
+                    amount_toman = successful_payment['total_amount']
+                    
+                    # نمایش لاگ با آیدی کاربر
+                    if username != 'N/A':
+                        print(f"✅ پرداخت موفق توسط @{username}: {amount_toman} تومان")
+                    else:
+                        print(f"✅ پرداخت موفق توسط ID:{user_id}: {amount_toman} تومان")
+                    
+                    # یافتن نوع پکیج بر اساس مبلغ
+                    package_type = None
+                    for pkg, details in PACKAGES.items():
+                        if details["price"] == amount_toman:
+                            package_type = pkg
+                            break
+                    
+                    if package_type:
+                        # محاسبه زمان انقضا
+                        duration_days = PACKAGES[package_type]["duration"]
+                        expiry = time.time() + (duration_days * 24 * 3600)
+                        
+                        # ذخیره اطلاعات پکیج
+                        active_packages[user_id] = {
+                            "type": package_type,
+                            "expiry": expiry,
+                            "purchase_time": time.time(),
+                            "chat_id": chat_id
+                        }
+                        
+                        # تنظیم تعداد درخواست‌های برنامه‌ریزی
+                        if "ماهانه" in package_type:
+                            remaining_program_requests[user_id] = 4
+                        elif "هفتگی" in package_type:
+                            remaining_program_requests[user_id] = 1
+                        
+                        # ارسال پیام تایید
+                        expiry_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(expiry))
+                        message_text = (
+                            f"✅ پرداخت شما با موفقیت انجام شد!\n"
+                            f"📦 پکیج: {package_type}\n"
+                            f"⏳ اعتبار تا: {expiry_date}\n\n"
+                            f"امکانات ویژه شما فعال شد:\n"
+                            f"- سوال کردن! ❓\n"
+                        )
+                        
+                        # اضافه کردن اطلاعات برنامه ویژه برای پکیج‌های هفتگی و ماهانه
+                        if "هفتگی" in package_type or "ماهانه" in package_type:
+                            message_text += f"- برنامه ویژه ⭐\n\n"
+                            if "ماهانه" in package_type:
+                                message_text += f"📌 شما می‌توانید تا ۴ درخواست برنامه‌ریزی ارسال کنید"
+                            elif "هفتگی" in package_type:
+                                message_text += f"📌 شما می‌توانید ۱ درخواست برنامه‌ریزی ارسال کنید"
+                        
+                        send_message(chat_id, message_text, get_main_menu(user_id, active_packages))
+                    else:
+                        send_message(chat_id, "✅ پرداخت شما با موفقیت انجام شد! اما پکیج مرتبط یافت نشد. لطفاً با پشتیبانی تماس بگیرید.")
+                    continue
+
+                # مدیریت وضعیت پاسخگویی (مرحله 1: دریافت آیدی کاربر)
+                if user_id in user_states and user_states[user_id] == "answering_step1":
+                    if text == "لغو عملیات ❌":
+                        send_message(chat_id, "عملیات لغو شد.", get_main_menu(user_id, active_packages))
+                        del user_states[user_id]
+                    else:
+                        # ذخیره آیدی کاربر هدف
+                        user_states[user_id] = "answering_step2"
+                        answer_target_user = text.strip()
+                        send_message(
+                            chat_id,
+                            f"👤 آیدی کاربر: {answer_target_user}\n\n"
+                            "لطفاً پاسخ خود را وارد کنید:",
+                            ANSWER_USER_MENU
+                        )
+                    continue
+                
+                # مدیریت وضعیت پاسخگویی (مرحله 2: دریافت متن پاسخ)
+                if user_id in user_states and user_states[user_id] == "answering_step2":
+                    if text == "لغو عملیات ❌":
+                        send_message(chat_id, "عملیات لغو شد.", get_main_menu(user_id, active_packages))
+                        del user_states[user_id]
+                    else:
+                        # ارسال پاسخ به کاربر
+                        try:
+                            target_id = int(answer_target_user)
+                            send_message(
+                                target_id,
+                                f"📬 پاسخ از پشتیبانی:\n\n{text}"
+                            )
+                            send_message(
+                                chat_id,
+                                f"✅ پاسخ با موفقیت به کاربر {answer_target_user} ارسال شد.",
+                                get_main_menu(user_id, active_packages)
+                            )
+                            
+                            # نمایش لاگ ارسال پاسخ
+                            print(f"✉️ پاسخ ارسال شده به کاربر {answer_target_user}: {text[:30]}...")
+                        except:
+                            send_message(
+                                chat_id,
+                                "❌ خطا در ارسال پاسخ! لطفاً آیدی کاربر را به صورت عددی وارد کنید.",
+                                get_main_menu(user_id, active_packages)
+                            )
+                        finally:
+                            del user_states[user_id]
+                    continue
+
+                # مدیریت وضعیت کاربر (اگر در حال پرسیدن سوال است)
+                if user_id in user_states and user_states[user_id] == "asking_question":
+                    if text == "بازگشت به منوی اصلی 🏠":
+                        send_message(chat_id, "بازگشت به منوی اصلی 🏠", get_main_menu(user_id, active_packages))
+                        del user_states[user_id]
+                    else:
+                        # نمایش لاگ سوال با آیدی کاربر
+                        if username != 'N/A':
+                            print(f"❓ سوال از @{username}: {text}")
+                        else:
+                            print(f"❓ سوال از ID:{user_id}: {text}")
+                        
+                        # اعلام دریافت سوال به کاربر
+                        send_message(
+                            chat_id, 
+                            "✅ سوال شما با موفقیت دریافت و ثبت شد.\n"
+                            "پشتیبان‌ها به زودی پاسخ شما را ارسال خواهند کرد.",
+                            QUESTION_MENU
+                        )
+                        
+                        # ذخیره سوال در بایگانی
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        archived_questions.append({
+                            "user_id": user_id,
+                            "username": username if username != 'N/A' else None,
+                            "question": text,
+                            "timestamp": timestamp,
+                            "type": "سوال"
+                        })
+                    continue
+                
+                # مدیریت درخواست برنامه ویژه
+                if user_id in user_states and user_states[user_id] == "program_request":
+                    if text == "بازگشت به منوی اصلی 🏠":
+                        send_message(chat_id, "بازگشت به منوی اصلی 🏠", get_main_menu(user_id, active_packages))
+                        del user_states[user_id]
+                    else:
+                        # بررسی اعتبار پکیج و تعداد درخواست‌ها
+                        if user_id in active_packages and time.time() < active_packages[user_id]["expiry"]:
+                            package_type = active_packages[user_id]["type"]
+                            
+                            # کسر تعداد درخواست‌ها
+                            if user_id in remaining_program_requests and remaining_program_requests[user_id] > 0:
+                                remaining_program_requests[user_id] -= 1
+                                
+                                # ذخیره درخواست در بایگانی
+                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                                archived_questions.append({
+                                    "user_id": user_id,
+                                    "username": username if username != 'N/A' else None,
+                                    "question": text,
+                                    "timestamp": timestamp,
+                                    "type": "درخواست برنامه ویژه"
+                                })
+                                
+                                # ارسال پیام تأیید
+                                send_message(
+                                    chat_id,
+                                    "✅ درخواست برنامه ویژه شما ثبت شد.\n\n"
+                                    "برنامه هفتگی شما به زودی آماده و ارسال خواهد شد.\n\n"
+                                    f"📝 تعداد درخواست‌های باقیمانده: {remaining_program_requests[user_id]}",
+                                    get_main_menu(user_id, active_packages)
+                                )
+                                
+                                # نمایش لاگ
+                                print(f"🌟 درخواست برنامه ویژه از کاربر {user_id}: {text[:50]}...")
+                            else:
+                                send_message(
+                                    chat_id,
+                                    "⛔️ تعداد درخواست‌های برنامه ویژه شما به پایان رسیده است.",
+                                    get_main_menu(user_id, active_packages)
+                                )
+                        else:
+                            send_message(chat_id, "⚠️ پکیج شما منقضی شده است.", get_main_menu(user_id, active_packages))
+                        
+                        del user_states[user_id]
+                    continue
+                    
+                # مدیریت وضعیت کاربر (اگر در حال وارد کردن کد هدیه است)
+                if user_id in user_states and user_states[user_id] == "entering_gift_code":
+                    if text == "بازگشت به منوی اصلی 🏠":
+                        send_message(chat_id, "بازگشت به منوی اصلی 🏠", get_main_menu(user_id, active_packages))
+                        del user_states[user_id]
+                    else:
+                        # نمایش لاگ کد هدیه با آیدی کاربر
+                        if username != 'N/A':
+                            print(f"🎁 کد هدیه از @{username}: {text}")
+                        else:
+                            print(f"🎁 کد هدیه از ID:{user_id}: {text}")
+                        
+                        # بررسی کد هدیه
+                        if text in GIFT_CODES:
+                            # فعال‌سازی پکیج هفتگی رایگان
+                            package_type = "هفتگی رایگان - کد هدیه"
+                            duration_days = PACKAGES[package_type]["duration"]
+                            expiry = time.time() + (duration_days * 24 * 3600)
+                            
+                            # ذخیره اطلاعات پکیج
+                            active_packages[user_id] = {
+                                "type": package_type,
+                                "expiry": expiry,
+                                "purchase_time": time.time(),
+                                "chat_id": chat_id
+                            }
+                            
+                            # تنظیم تعداد درخواست‌های برنامه‌ریزی
+                            remaining_program_requests[user_id] = 1
+                            
+                            # اگر کد هدیه ویژه بود، کاربر را به لیست ویژه اضافه کن
+                            if text == "13831391":
+                                special_users.add(user_id)
+                                print(f"🌟 کاربر ویژه اضافه شد: {user_id}")
+                            
+                            # ارسال پیام تبریک
+                            expiry_date = time.strftime("%Y-%m-%d %H:%M", time.localtime(expiry))
+                            message_text = (
+                                f"🎉 تبریک! کد هدیه شما معتبر است!\n\n"
+                                f"🎁 پکیج هفتگی رایگان برای شما فعال شد\n"
+                                f"📦 پکیج: {package_type}\n"
+                                f"⏳ اعتبار تا: {expiry_date}\n\n"
+                                f"امکانات ویژه شما فعال شد:\n"
+                                f"- سوال کردن! ❓\n"
+                                f"- برنامه ویژه ⭐\n\n"
+                                f"📌 شما می‌توانید ۱ درخواست برنامه‌ریزی ارسال کنید"
+                            )
+                            send_message(chat_id, message_text, get_main_menu(user_id, active_packages))
+                            
+                            # نمایش لاگ فعال‌سازی با آیدی کاربر
+                            if username != 'N/A':
+                                print(f"🎉 پکیج رایگان برای @{username} فعال شد")
+                            else:
+                                print(f"🎉 پکیج رایگان برای ID:{user_id} فعال شد")
+                        else:
+                            send_message(chat_id, "❌ کد هدیه وارد شده معتبر نیست. لطفاً دوباره تلاش کنید.", GIFT_CODE_MENU)
+                        del user_states[user_id]
+                    continue
+
+                # دستورات اصلی
+                if text == "/start":
+                    # پیام تبلیغاتی و معرفی
+                    promo_message = (
+                        "🌟 **به ربات مشاوره‌ای نخبگان خوش آمدید!** 🌟\n\n"
+                        "ما با اطمینان به شما قول می‌دهیم که انتخاب ما، تضمینی برای موفقیت شماست! 💯\n\n"
+                        "✅ **چرا ما را انتخاب کنید؟**\n"
+                        "- مشاوران ما همگی از **رتبه‌های برتر کنکور** هستند\n"
+                        "- دارای **سابقه درخشان** و **تخصص بالا** در زمینه مشاوره\n"
+                        "- **تضمین کیفیت** خدمات با پشتیبانی ۲۴ ساعته\n\n"
+                        "💎 **پکیج‌های استثنایی با قیمت‌های باورنکردنی:**\n"
+                        "▫️ پکیج روزانه - فقط ۲۰ هزار تومان\n"
+                        "▫️ پکیج هفتگی - فقط ۱۰۰ هزار تومان\n"
+                        "▫️ پکیج ماهانه - فقط ۲۰۰ هزار تومان\n\n"
+                        "🔥 این قیمت‌ها در مقابل خدمات حرفه‌ای ما **ناچیز** است!\n"
+                        "شما هیچ‌جا چنین خدمات باکیفیتی با این قیمت‌های استثنایی پیدا نخواهید کرد!\n\n"
+                        "برای شروع مسیر موفقیت، همین الان یکی از پکیج‌ها را انتخاب کنید:"
+                    )
+                    send_message(chat_id, promo_message, get_main_menu(user_id, active_packages))
+                elif text == "پشتیبانی 👨‍💼":
+                    send_message(chat_id, f"برای پشتیبانی لطفاً با آیدی زیر تماس بگیرید:\n👨‍💼 {SUPPORT_ID}")
+                elif text == "سوال کردن! ❓":
+                    # بررسی اعتبار پکیج
+                    if user_id in active_packages and time.time() < active_packages[user_id]["expiry"]:
+                        user_states[user_id] = "asking_question"
+                        send_message(
+                            chat_id, 
+                            "لطفاً سوال خود را تایپ کنید:",
+                            QUESTION_MENU
+                        )
+                    else:
+                        send_message(chat_id, "⚠️ برای استفاده از این قابلیت، باید پکیج فعال داشته باشید.")
+                elif text == "برنامه ویژه ⭐":
+                    # بررسی اعتبار پکیج
+                    if user_id in active_packages and time.time() < active_packages[user_id]["expiry"]:
+                        package_type = active_packages[user_id]["type"]
+                        
+                        # بررسی نوع پکیج
+                        if "هفتگی" in package_type or "ماهانه" in package_type:
+                            # بررسی تعداد درخواست‌های باقیمانده
+                            if user_id in remaining_program_requests and remaining_program_requests[user_id] > 0:
+                                user_states[user_id] = "program_request"
+                                send_message(
+                                    chat_id,
+                                    "📝 لطفاً اطلاعات زیر را وارد کنید:\n\n"
+                                    "1. روزهای هفته و زمان‌های خالی خود\n"
+                                    "2. مشغله‌های ثابت (کار، کلاس، ...)\n"
+                                    "3. دروس یا موضوعاتی که می‌خواهید مطالعه کنید\n"
+                                    "4. اهداف و اولویت‌های شما\n\n"
+                                    "ما بر اساس این اطلاعات یک برنامه هفتگی شخصی‌سازی شده برای شما آماده می‌کنیم.",
+                                    PROGRAM_MENU
+                                )
+                            else:
+                                send_message(
+                                    chat_id,
+                                    "⛔️ تعداد درخواست‌های برنامه ویژه شما به پایان رسیده است.",
+                                    get_main_menu(user_id, active_packages)
+                                )
+                        else:
+                            send_message(chat_id, "⚠️ این قابلیت فقط برای پکیج‌های هفتگی و ماهانه فعال است.")
+                    else:
+                        send_message(chat_id, "⚠️ برای استفاده از این قابلیت، باید پکیج فعال داشته باشید.")
+                elif text == "پکیج‌ها 💼":
+                    send_message(chat_id, "لطفاً یکی از پکیج‌ها را انتخاب کنید:", PACKAGE_MENU)
+                elif text in PACKAGES:
+                    # ارسال درخواست پرداخت
+                    amount = PACKAGES[text]["price"]
+                    package_name = text.split("-")[0].strip()
+                    
+                    # ایجاد شناسه یکتا برای تراکنش
+                    transaction_id = f"{user_id}_{int(time.time())}"
+                    
+                    # محدودیت طول عنوان و توضیحات
+                    title = f"پکیج {package_name}"[:32]
+                    
+                    # توضیحات با متن اطمینان‌بخش (کوتاه‌تر)
+                    description = (
+                        "خرید پکیج - خیالتون راحت، اطلاعات سازنده در دسترس بله است. "
+                        "در صورت نارضایتی، هزینه برگشت داده می‌شود."
+                    )[:255]
+                    
+                    # ارسال درخواست پرداخت بدون تصویر
+                    print(f"🔄 در حال ارسال درخواست پرداخت برای {title}...")
+                    print(f"📦 پکیج: {text}")
+                    print(f"💰 مبلغ: {amount} ریال")
+                    
+                    result = send_invoice(
+                        chat_id=chat_id,
+                        title=title,
+                        description=description,
+                        payload=transaction_id,
+                        prices=[{"label": text, "amount": amount}]
+                    )
+                    
+                    if result is None:
+                        print("❌ ارسال درخواست پرداخت ناموفق بود")
+                        send_message(
+                            chat_id,
+                            "⚠️ در ایجاد درخواست پرداخت مشکلی پیش آمد. لطفاً دوباره امتحان کنید."
+                        )
+                elif text == "کد هدیه 🎁":
+                    user_states[user_id] = "entering_gift_code"
+                    send_message(
+                        chat_id,
+                        "🎁 لطفاً کد هدیه خود را وارد کنید:\n\n"
+                        "پس از وارد کردن کد، پکیج هفتگی رایگان برای شما فعال خواهد شد.",
+                        GIFT_CODE_MENU
+                    )
+                elif text == "بایگانی سوالات 📂":
+                    # فقط کاربران ویژه می‌توانند بایگانی را ببینند
+                    if user_id in special_users:
+                        if not archived_questions:
+                            send_message(chat_id, "هنوز هیچ سوالی در بایگانی وجود ندارد.")
+                        else:
+                            # ساخت متن بایگانی
+                            archive_text = "📂 بایگانی سوالات و درخواست‌ها:\n\n"
+                            for idx, question in enumerate(archived_questions, 1):
+                                # نمایش هم آیدی عددی و هم آیدی بله
+                                user_info = f"👤 آیدی عددی: {question['user_id']}"
+                                if question['username']:
+                                    user_info += f" | آیدی بله: @{question['username']}"
+                                
+                                # تعیین نوع محتوا
+                                content_type = "سوال" if question['type'] == "سوال" else "درخواست برنامه ویژه"
+                                
+                                archive_text += (
+                                    f"{idx}. {user_info}\n"
+                                    f"⏰ زمان: {question['timestamp']}\n"
+                                    f"📝 نوع: {content_type}\n"
+                                    f"💬 محتوا: {question['question']}\n\n"
+                                )
+                            
+                            # ارسال بایگانی
+                            send_message(chat_id, archive_text)
+                    else:
+                        send_message(chat_id, "⛔️ دسترسی به بایگانی سوالات برای شما مجاز نیست.")
+                elif text == "ارسال جواب ✉️":
+                    # فقط کاربران ویژه می‌توانند پاسخ ارسال کنند
+                    if user_id in special_users:
+                        user_states[user_id] = "answering_step1"
+                        send_message(
+                            chat_id,
+                            "لطفاً آیدی عددی کاربری که می‌خواهید به او پاسخ دهید را وارد کنید:",
+                            ANSWER_USER_MENU
+                        )
+                    else:
+                        send_message(chat_id, "⛔️ دسترسی به این قابلیت برای شما مجاز نیست.")
+                elif text == "لغو عملیات ❌":
+                    if user_id in user_states:
+                        del user_states[user_id]
+                    send_message(chat_id, "عملیات لغو شد.", get_main_menu(user_id, active_packages))
+                elif text == "بازگشت به منوی اصلی 🏠":
+                    if user_id in user_states:
+                        del user_states[user_id]
+                    send_message(chat_id, "بازگشت به منوی اصلی 🏠", get_main_menu(user_id, active_packages))
+                else:
+                    send_message(chat_id, "لطفاً فقط از گزینه‌های موجود استفاده کن.", get_main_menu(user_id, active_packages))
+
+            # افزایش آپدیت آیدی برای دریافت بعدی
+            if updates["result"]:
+                last_update_id = max(update["update_id"] for update in updates["result"]) + 1
+
+        except Exception as e:
+            print(f"خطا در حلقه اصلی: {str(e)}")
+            time.sleep(5)
+        
+        time.sleep(1)
+
+
+if __name__ == "__main__":
+    main()
